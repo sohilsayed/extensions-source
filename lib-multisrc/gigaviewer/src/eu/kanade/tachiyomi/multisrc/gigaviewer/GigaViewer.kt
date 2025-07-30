@@ -5,7 +5,6 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Rect
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.asObservableIgnoreCode
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -17,6 +16,7 @@ import eu.kanade.tachiyomi.util.asJsoup
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import okhttp3.Call
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
@@ -26,6 +26,7 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import rx.Observable
 import uy.kohesive.injekt.injectLazy
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
@@ -79,7 +80,7 @@ abstract class GigaViewer(
     override fun latestUpdatesNextPageSelector(): String? = null
 
     // The search returns 404 when there's no results.
-    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): rx.Observable<MangasPage> {
+    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
         return client.newCall(searchMangaRequest(page, query, filters))
             .asObservableIgnoreCode(404)
             .map(::searchMangaParse)
@@ -162,7 +163,7 @@ abstract class GigaViewer(
             chapters += chapterList.map { chapter ->
                 SChapter.create().apply {
                     name = chapter.title
-                    date_upload = runCatching { API_DATE_PARSER.parse(chapter.displayOpenAt)?.time }.getOrNull() ?: 0L
+                    date_upload = runCatching { DATE_PARSER.parse(chapter.displayOpenAt)?.time }.getOrNull() ?: 0L
                     setUrlWithoutDomain(chapter.viewerUri)
                 }
             }
@@ -217,7 +218,7 @@ abstract class GigaViewer(
             .mapIndexed { i, page ->
                 val imageUrl = page.src.toHttpUrl().newBuilder()
                     .addQueryParameter("width", page.width.toString())
-                    .addQueryPrameter("height", page.height.toString())
+                    .addQueryParameter("height", page.height.toString()) // Corrected typo
                     .toString()
                 Page(i, document.location(), imageUrl)
             }
@@ -303,6 +304,15 @@ abstract class GigaViewer(
         return output.toByteArray()
     }
 
+    private fun Call.asObservableIgnoreCode(code: Int): Observable<Response> {
+        return toObservable().doOnNext { response -> // Corrected to `toObservable()`
+            if (!response.isSuccessful && response.code != code) {
+                response.close()
+                throw Exception("HTTP error ${response.code}")
+            }
+        }
+    }
+
     private fun String.toDate(): Long {
         return runCatching { DATE_PARSER.parse(this)?.time }
             .getOrNull() ?: 0L
@@ -313,6 +323,29 @@ abstract class GigaViewer(
         val title: String,
         @kotlinx.serialization.SerialName("viewer_uri") val viewerUri: String,
         @kotlinx.serialization.SerialName("display_open_at") val displayOpenAt: String,
+    )
+
+    @kotlinx.serialization.Serializable
+    private data class GigaViewerEpisodeDto(
+        val readableProduct: ReadableProduct,
+    )
+
+    @kotlinx.serialization.Serializable
+    private data class ReadableProduct(
+        val pageStructure: PageStructure,
+    )
+
+    @kotlinx.serialization.Serializable
+    private data class PageStructure(
+        val pages: List<ImagePage>,
+    )
+
+    @kotlinx.serialization.Serializable
+    private data class ImagePage(
+        val src: String,
+        val width: Int,
+        val height: Int,
+        val type: String,
     )
 
     companion object {
