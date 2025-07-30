@@ -135,50 +135,54 @@ abstract class GigaViewer(
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val document = response.asJsoup()
-        val aggregateId = document.selectFirst("script.js-valve")!!.attr("data-giga_series")
+    val document = response.asJsoup()
+    val aggregateId = document.selectFirst("script.js-valve")
+        ?.attr("data-giga_series")
+        ?: return emptyList()
 
-        val newHeaders = headers.newBuilder()
-            .set("Referer", response.request.url.toString())
-            .build()
+    val chapters = mutableListOf<SChapter>()
+    var offset = 0
+    val limit = 100
 
-        var readMoreEndpoint = baseUrl.toHttpUrl().newBuilder()
-            .addPathSegment("api")
-            .addPathSegment("viewer")
-            .addPathSegment("readable_products")
-            .addQueryParameter("aggregate_id", aggregateId)
-            .addQueryParameter("number_since", Int.MAX_VALUE.toString())
-            .addQueryParameter("number_until", "0")
-            .addQueryParameter("read_more_num", "150")
+    while (true) {
+        val apiUrl = baseUrl.toHttpUrl().newBuilder()
+            .addPathSegments("api/viewer/pagination_readable_products")
             .addQueryParameter("type", "episode")
+            .addQueryParameter("aggregate_id", aggregateId)
+            .addQueryParameter("offset", offset.toString())
+            .addQueryParameter("limit", limit.toString())
+            .addQueryParameter("sort_order", "desc")
             .build()
-            .toString()
 
-        val chapters = mutableListOf<SChapter>()
+        val apiResponse = client.newCall(GET(apiUrl, headers)).execute()
+        val apiJson = apiResponse.body.string()
 
-        var request = GET(readMoreEndpoint, newHeaders)
-        var result = client.newCall(request).execute()
-
-        while (result.code != 404) {
-            val jsonResult = json.parseToJsonElement(result.body.string()).jsonObject
-            readMoreEndpoint = jsonResult["nextUrl"]!!.jsonPrimitive.content
-            val tempDocument = Jsoup.parse(
-                jsonResult["html"]!!.jsonPrimitive.content,
-                response.request.url.toString(),
-            )
-
-            tempDocument
-                .select("ul.series-episode-list " + chapterListSelector())
-                .mapTo(chapters) { element -> chapterFromElement(element) }
-
-            request = GET(readMoreEndpoint, newHeaders)
-            result = client.newCall(request).execute()
+        // If the API returns an empty response, stop.
+        if (apiJson.isBlank()) {
+            break
         }
 
-        result.close()
+        val chapterList = json.decodeFromString<List<ApiChapter>>(apiJson)
 
-        return chapters
+        chapters += chapterList.map { chapter ->
+            SChapter.create().apply {
+                name = chapter.title
+                date_upload = runCatching { API_DATE_PARSER.parse(chapter.displayOpenAt)?.time }.getOrNull() ?: 0L
+                setUrlWithoutDomain(chapter.viewerUri)
+            }
+        }
+
+        // Stop if we've received the last page of chapters
+        if (chapterList.size < limit) {
+            break
+        }
+
+        offset += limit
     }
+
+    return chapters
+}
+
 
     override fun chapterListSelector() = "li.episode"
 
@@ -332,4 +336,10 @@ abstract class GigaViewer(
         private const val YEN_BANKNOTE = "💴 "
         private const val LOCK = "🔒 "
     }
+@kotlinx.serialization.Serializable
+private data class ApiChapter(
+    val title: String,
+    @kotlinx.serialization.SerialName("viewer_uri") val viewerUri: String,
+    @kotlinx.serialization.SerialName("display_open_at") val displayOpenAt: String,
+)
 }
