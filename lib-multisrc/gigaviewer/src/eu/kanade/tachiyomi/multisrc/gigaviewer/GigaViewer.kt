@@ -5,7 +5,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Rect
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.asObservable
+import eu.kanade.tachiyomi.network.asObservableIgnoreCode
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -17,9 +17,6 @@ import eu.kanade.tachiyomi.util.asJsoup
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import okhttp3.Call
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
@@ -27,10 +24,8 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
-import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import rx.Observable
 import uy.kohesive.injekt.injectLazy
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
@@ -84,7 +79,7 @@ abstract class GigaViewer(
     override fun latestUpdatesNextPageSelector(): String? = null
 
     // The search returns 404 when there's no results.
-    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
+    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): rx.Observable<MangasPage> {
         return client.newCall(searchMangaRequest(page, query, filters))
             .asObservableIgnoreCode(404)
             .map(::searchMangaParse)
@@ -135,54 +130,53 @@ abstract class GigaViewer(
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-    val document = response.asJsoup()
-    val aggregateId = document.selectFirst("script.js-valve")
-        ?.attr("data-giga_series")
-        ?: return emptyList()
+        val document = response.asJsoup()
+        val aggregateId = document.selectFirst("script.js-valve")
+            ?.attr("data-giga_series")
+            ?: return emptyList()
 
-    val chapters = mutableListOf<SChapter>()
-    var offset = 0
-    val limit = 100
+        val chapters = mutableListOf<SChapter>()
+        var offset = 0
+        val limit = 100
 
-    while (true) {
-        val apiUrl = baseUrl.toHttpUrl().newBuilder()
-            .addPathSegments("api/viewer/pagination_readable_products")
-            .addQueryParameter("type", "episode")
-            .addQueryParameter("aggregate_id", aggregateId)
-            .addQueryParameter("offset", offset.toString())
-            .addQueryParameter("limit", limit.toString())
-            .addQueryParameter("sort_order", "desc")
-            .build()
+        while (true) {
+            val apiUrl = baseUrl.toHttpUrl().newBuilder()
+                .addPathSegments("api/viewer/pagination_readable_products")
+                .addQueryParameter("type", "episode")
+                .addQueryParameter("aggregate_id", aggregateId)
+                .addQueryParameter("offset", offset.toString())
+                .addQueryParameter("limit", limit.toString())
+                .addQueryParameter("sort_order", "desc")
+                .build()
 
-        val apiResponse = client.newCall(GET(apiUrl, headers)).execute()
-        val apiJson = apiResponse.body.string()
+            val apiResponse = client.newCall(GET(apiUrl, headers)).execute()
+            val apiJson = apiResponse.body.string()
 
-        // If the API returns an empty response, stop.
-        if (apiJson.isBlank()) {
-            break
-        }
-
-        val chapterList = json.decodeFromString<List<ApiChapter>>(apiJson)
-
-        chapters += chapterList.map { chapter ->
-            SChapter.create().apply {
-                name = chapter.title
-                date_upload = runCatching { API_DATE_PARSER.parse(chapter.displayOpenAt)?.time }.getOrNull() ?: 0L
-                setUrlWithoutDomain(chapter.viewerUri)
+            // If the API returns an empty response, stop.
+            if (apiJson.isBlank()) {
+                break
             }
+
+            val chapterList = json.decodeFromString<List<ApiChapter>>(apiJson)
+
+            chapters += chapterList.map { chapter ->
+                SChapter.create().apply {
+                    name = chapter.title
+                    date_upload = runCatching { API_DATE_PARSER.parse(chapter.displayOpenAt)?.time }.getOrNull() ?: 0L
+                    setUrlWithoutDomain(chapter.viewerUri)
+                }
+            }
+
+            // Stop if we've received the last page of chapters
+            if (chapterList.size < limit) {
+                break
+            }
+
+            offset += limit
         }
 
-        // Stop if we've received the last page of chapters
-        if (chapterList.size < limit) {
-            break
-        }
-
-        offset += limit
+        return chapters
     }
-
-    return chapters
-}
-
 
     override fun chapterListSelector() = "li.episode"
 
@@ -223,7 +217,7 @@ abstract class GigaViewer(
             .mapIndexed { i, page ->
                 val imageUrl = page.src.toHttpUrl().newBuilder()
                     .addQueryParameter("width", page.width.toString())
-                    .addQueryParameter("height", page.height.toString())
+                    .addQueryPrameter("height", page.height.toString())
                     .toString()
                 Page(i, document.location(), imageUrl)
             }
@@ -309,19 +303,17 @@ abstract class GigaViewer(
         return output.toByteArray()
     }
 
-    private fun Call.asObservableIgnoreCode(code: Int): Observable<Response> {
-        return asObservable().doOnNext { response ->
-            if (!response.isSuccessful && response.code != code) {
-                response.close()
-                throw Exception("HTTP error ${response.code}")
-            }
-        }
-    }
-
     private fun String.toDate(): Long {
         return runCatching { DATE_PARSER.parse(this)?.time }
             .getOrNull() ?: 0L
     }
+
+    @kotlinx.serialization.Serializable
+    private data class ApiChapter(
+        val title: String,
+        @kotlinx.serialization.SerialName("viewer_uri") val viewerUri: String,
+        @kotlinx.serialization.SerialName("display_open_at") val displayOpenAt: String,
+    )
 
     companion object {
         private val DATE_PARSER by lazy { SimpleDateFormat("yyyy/MM/dd", Locale.ENGLISH) }
@@ -336,10 +328,4 @@ abstract class GigaViewer(
         private const val YEN_BANKNOTE = "💴 "
         private const val LOCK = "🔒 "
     }
-@kotlinx.serialization.Serializable
-private data class ApiChapter(
-    val title: String,
-    @kotlinx.serialization.SerialName("viewer_uri") val viewerUri: String,
-    @kotlinx.serialization.SerialName("display_open_at") val displayOpenAt: String,
-)
 }
